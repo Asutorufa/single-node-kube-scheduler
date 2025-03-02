@@ -106,6 +106,8 @@ func (k *Kubernetes) setAlreadyExists(ctx context.Context) error {
 }
 
 func (k *Kubernetes) Run(ctx context.Context) {
+	go k.startWatchNode(ctx)
+
 	if err := k.setAlreadyExists(ctx); err != nil {
 		slog.Error("set already exists", "error", err)
 
@@ -172,4 +174,40 @@ func (k *Kubernetes) startWatch(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func (k *Kubernetes) startWatchNode(ctx context.Context) {
+	slog.Info("start watch node")
+
+	for {
+		watcher, err := k.Client.CoreV1().Nodes().Watch(ctx, v1.ListOptions{
+			Watch: true,
+		})
+		if err != nil {
+			slog.Error("start watch node", "error", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		for event := range watcher.ResultChan() {
+			node, ok := event.Object.(*corev1.Node)
+			if !ok {
+				continue
+			}
+
+			slog.Info("check node changed, relist pods", "node", node.Name, "status", node.Status.Conditions, "type", event.Type)
+
+			for {
+				time.Sleep(5 * time.Second)
+				if err := k.setAlreadyExists(ctx); err != nil {
+					slog.Error("set already exists", "error", err)
+					continue
+				}
+
+				break
+			}
+		}
+
+		time.Sleep(5 * time.Second)
+	}
 }

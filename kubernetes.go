@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -18,7 +19,7 @@ import (
 )
 
 type Kubernetes struct {
-	node   string
+	node   atomic.Pointer[string]
 	Client *kubernetes.Clientset
 }
 
@@ -52,7 +53,8 @@ func newKubernetes() (*Kubernetes, error) {
 		return nil, err
 	}
 
-	kcli.node = node
+	kcli.node.Store(&node)
+
 	return kcli, nil
 }
 
@@ -77,10 +79,14 @@ type Pod struct {
 }
 
 func (k *Kubernetes) setAlreadyExists(ctx context.Context) error {
-	ls, err := k.Client.CoreV1().Pods("").List(ctx, v1.ListOptions{})
+	ls, err := k.Client.CoreV1().Pods("").List(ctx, v1.ListOptions{
+		FieldSelector: "status.phase=Pending,spec.nodeName=",
+	})
 	if err != nil {
 		return err
 	}
+
+	slog.Info("set already exists", "count", len(ls.Items))
 
 	for _, l := range ls.Items {
 		if l.Spec.NodeName != "" {
@@ -89,7 +95,7 @@ func (k *Kubernetes) setAlreadyExists(ctx context.Context) error {
 		}
 		binding := &corev1.Binding{
 			ObjectMeta: metav1.ObjectMeta{Namespace: l.Namespace, Name: l.Name, UID: l.UID},
-			Target:     corev1.ObjectReference{Kind: "Node", Name: k.node},
+			Target:     corev1.ObjectReference{Kind: "Node", Name: *k.node.Load()},
 		}
 
 		err := k.Client.CoreV1().Pods(l.Namespace).Bind(
@@ -149,17 +155,19 @@ func (k *Kubernetes) startWatch(ctx context.Context) error {
 			continue
 		}
 
+		slog.Info("pod event", "namespace", pod.Namespace, "name", pod.Name, "node_name", pod.Spec.NodeName, "type", event.Type)
+
 		switch event.Type {
 		case watch.Added, watch.Modified:
 			if pod.Spec.NodeName != "" {
 				continue
 			}
 
-			slog.Info("set pod node", "namespace", pod.Namespace, "name", pod.Name, "node", k.node)
+			slog.Info("set pod node", "namespace", pod.Namespace, "name", pod.Name, "node", *k.node.Load())
 
 			binding := &corev1.Binding{
 				ObjectMeta: metav1.ObjectMeta{Namespace: pod.Namespace, Name: pod.Name, UID: pod.UID},
-				Target:     corev1.ObjectReference{Kind: "Node", Name: k.node},
+				Target:     corev1.ObjectReference{Kind: "Node", Name: *k.node.Load()},
 			}
 
 			err := k.Client.CoreV1().Pods(pod.Namespace).Bind(
@@ -195,7 +203,20 @@ func (k *Kubernetes) startWatchNode(ctx context.Context) {
 				continue
 			}
 
-			slog.Info("check node changed, relist pods", "node", node.Name, "status", node.Status.Conditions, "type", event.Type)
+			args := []any{
+				slog.String("node", node.Name),
+				slog.Any("type", event.Type),
+			}
+
+			for _, v := range node.Status.Conditions {
+				args = append(args, slog.String(string(v.Type), string(v.Status)))
+			}
+
+			slog.Info("check node changed, relist pods", args...)
+
+			if (event.Type == watch.Added || event.Type == watch.Modified) && node.Name != "" {
+				k.node.Store(&node.Name)
+			}
 
 			for {
 				time.Sleep(5 * time.Second)
